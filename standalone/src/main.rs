@@ -16,7 +16,6 @@ async fn main() -> Result<()> {
     println!("{}", serde_yaml::to_string(&config).unwrap());
 
     let console = Console::new("standalone");
-    let mut hc = HttpCheck::new_impl(&console, config.init_config, config.instances[0].clone());
-    let _ = hc.check().await;
-    Ok(())
+    let mut hc = HttpCheck::new(&console, config.init_config, config.instances[0].clone());
+    hc.check().await
 }

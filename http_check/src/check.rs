@@ -25,6 +25,8 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpStream;
 use tokio::time;
 
+use async_trait::async_trait;
+
 use dd_rs_checks::{GenericError, Result};
 use dd_rs_checks::{Mapping, check::Check, sink::Sink};
 use dd_rs_checks::{
@@ -72,16 +74,17 @@ struct LightServiceCheck {
     message: SvcCheckMessage,
 }
 
-pub struct HttpCheck<'a, S: Sink> {
-    sink: &'a S,
+pub struct HttpCheck<'a> {
+    sink: &'a dyn Sink,
     instance_config: config::Instance,
     init_config: config::Init,
     service_checks: Vec<LightServiceCheck>,
     tags: HashMap<String, String>,
 }
 
-impl<'a, S: Sink> Check<'a, S> for HttpCheck<'a, S> {
-    fn build(sink: &'a S, _init_config: &Mapping, _instance_config: &Mapping) -> impl Check<'a, S> {
+#[async_trait]
+impl<'a> Check<'a> for HttpCheck<'a> {
+    fn build(sink: &'a dyn Sink, _init_config: &Mapping, _instance_config: &Mapping) -> Self {
         Self {
             sink,
             instance_config: Instance::default(),
@@ -91,14 +94,18 @@ impl<'a, S: Sink> Check<'a, S> for HttpCheck<'a, S> {
         }
     }
 
-    fn run(&mut self) -> impl std::future::Future<Output = Result<()>> + Send + Sync {
-        self.check()
+    async fn run(&mut self) -> Result<()> {
+        self.check().await
     }
 }
 
-impl<'a, S: Sink> HttpCheck<'a, S> {
+impl<'a> HttpCheck<'a> {
     // FIXME name
-    pub fn new_impl(sink: &'a S, init_config: config::Init, instance_config: config::Instance) -> Self {
+    pub fn new(
+        sink: &'a dyn Sink,
+        init_config: config::Init,
+        instance_config: config::Instance,
+    ) -> Self {
         Self {
             sink,
             instance_config,
