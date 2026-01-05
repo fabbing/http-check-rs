@@ -1,5 +1,5 @@
 pub mod check;
-pub mod sink;
+pub mod config;
 pub mod version;
 
 pub use anyhow::{Result, anyhow, bail};
