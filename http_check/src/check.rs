@@ -74,8 +74,11 @@ struct LightServiceCheck {
     message: SvcCheckMessage,
 }
 
-pub struct HttpCheck<'a> {
-    sink: &'a dyn Sink,
+pub struct HttpCheck<S>
+where
+    S: Sink + Send + Sync,
+{
+    sink: S,
     instance_config: config::Instance,
     init_config: config::Init,
     service_checks: Vec<LightServiceCheck>,
@@ -83,15 +86,19 @@ pub struct HttpCheck<'a> {
 }
 
 #[async_trait]
-impl<'a> Check<'a> for HttpCheck<'a> {
-    fn build(sink: &'a dyn Sink, _init_config: &Mapping, _instance_config: &Mapping) -> Self {
-        Self {
-            sink,
-            instance_config: Instance::default(),
-            init_config: Init::default(),
-            service_checks: vec![],
-            tags: HashMap::<String, String>::new(),
-        }
+impl<S> Check for HttpCheck<S>
+where
+    S: Sink + Send + Sync,
+{
+    type Snk = S;
+
+    fn build(sink: S, _init_config: Mapping, _instance_config: Mapping) -> Self
+    where
+        S: Sink + Send + Sync,
+    {
+        let init_config = Init::default();
+        let instance_config = Instance::default();
+        HttpCheck::<S>::new(sink, init_config, instance_config)
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -99,13 +106,12 @@ impl<'a> Check<'a> for HttpCheck<'a> {
     }
 }
 
-impl<'a> HttpCheck<'a> {
+impl<S> HttpCheck<S>
+where
+    S: Sink + Send + Sync,
+{
     // FIXME name
-    pub fn new(
-        sink: &'a dyn Sink,
-        init_config: config::Init,
-        instance_config: config::Instance,
-    ) -> Self {
+    pub fn new(sink: S, init_config: config::Init, instance_config: config::Instance) -> Self {
         Self {
             sink,
             instance_config,
