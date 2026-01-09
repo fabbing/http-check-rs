@@ -92,12 +92,14 @@ where
 {
     type Snk = S;
 
-    fn build(sink: S, _init_config: Mapping, _instance_config: Mapping) -> Self
+    fn build(sink: S, init_config: Mapping, instance_config: Mapping) -> Self
     where
         S: Sink + Send + Sync,
     {
-        let init_config = Init::default();
-        let instance_config = Instance::default();
+        let init_config: Init = serde_yaml::from_value(serde_yaml::Value::Mapping(init_config))
+            .expect("Failed to parse init_config");
+        let instance_config: Instance = serde_yaml::from_value(serde_yaml::Value::Mapping(instance_config))
+            .expect("Failed to parse instance_config");
         HttpCheck::<S>::new(sink, init_config, instance_config)
     }
 
@@ -123,7 +125,7 @@ where
 
     pub async fn check(&mut self) -> Result<()> {
         if let Err(err) = self.check_impl().await {
-            self.sink.log(log::Level::Error, err.to_string())
+            self.sink.log(log::Level::Error, err.to_string()).await
         }
         Ok(())
     }
@@ -161,20 +163,22 @@ where
             && self.instance_config.tls_verify.is_some_and(|v| !v)
             && !self.instance_config.tls_ignore_warning.is_some_and(|v| v)
         {
-            self.sink.log(
-                log::Level::Debug,
-                format!(
-                    "An unverified HTTPS request is being made to {}",
-                    self.instance_config.url
-                ),
-            )
+            self.sink
+                .log(
+                    log::Level::Debug,
+                    format!(
+                        "An unverified HTTPS request is being made to {}",
+                        self.instance_config.url
+                    ),
+                )
+                .await
         }
 
         let tls = self.make_tls_connector()?; // TODO don't need it for http
         let request = self.make_request()?;
 
         self.sink
-            .log(log::Level::Debug, format!("Connecting to {url}"));
+            .log(log::Level::Debug, format!("Connecting to {url}")).await;
 
         let start_time = Instant::now();
         let elapsed = || Instant::now().duration_since(start_time);
@@ -190,7 +194,7 @@ where
                     err.to_string(),
                     elapsed
                 ),
-            );
+            ).await;
             self.add_service_check(
                 SvcCheckEvent::Status,
                 service_check::Status::Critical,
@@ -214,39 +218,42 @@ where
                     "network.http.response_time",
                     (total_time.as_millis() as f64) / 1000.,
                 )
+                .await
             }
 
             if let Err(err) = self.handle_response(&mut response).await {
-                self.sink.log(
-                    log::Level::Error,
-                    format!(
-                        "Error reading response: {}. Connection failed after {} ms",
-                        err.to_string(),
-                        total_time.as_millis()
-                    ),
-                )
+                self.sink
+                    .log(
+                        log::Level::Error,
+                        format!(
+                            "Error reading response: {}. Connection failed after {} ms",
+                            err.to_string(),
+                            total_time.as_millis()
+                        ),
+                    )
+                    .await
             }
 
             let success = self.service_checks[0].status == service_check::Status::Ok;
             let can_status = if success { 1. } else { 0. };
             let cant_status = if success { 0. } else { 1. };
-            self.gauge("network.http.can_connect", can_status);
-            self.gauge("network.http.cant_connect", cant_status);
+            self.gauge("network.http.can_connect", can_status).await;
+            self.gauge("network.http.cant_connect", cant_status).await;
 
             if self
                 .instance_config
                 .check_certificate_expiration
                 .unwrap_or(defaults::CHECK_CERTIFICATE_EXPIRATION)
             {
-                self.check_certificate(maybe_certificate)
+                self.check_certificate(maybe_certificate).await
             }
         }
 
         let svc = std::mem::replace(&mut self.service_checks, vec![]);
-        svc.into_iter().for_each(|lsc| {
+        for lsc in svc {
             let sc = to_service_check(lsc, &service_tags);
-            self.sink.submit_service_check(sc)
-        });
+            self.sink.submit_service_check(sc).await;
+        }
 
         Ok(())
     }
@@ -314,10 +321,14 @@ where
         if is_https {
             match maybe_tls.unwrap().get_ref().peer_certificate() {
                 Ok(cert) => certificate = cert,
-                Err(err) => self.sink.log(
-                    log::Level::Error,
-                    format!("Read peer certificate: {}", err.to_string()),
-                ),
+                Err(err) => {
+                    self.sink
+                        .log(
+                            log::Level::Error,
+                            format!("Read peer certificate: {}", err.to_string()),
+                        )
+                        .await
+                }
             }
         }
 
@@ -382,7 +393,7 @@ where
         Ok(request.body(body)?)
     }
 
-    fn check_certificate(&mut self, maybe_certificate: Option<native_tls::Certificate>) {
+    async fn check_certificate(&mut self, maybe_certificate: Option<native_tls::Certificate>) {
         let certificate = match maybe_certificate {
             Some(cert) => cert,
             None => {
@@ -444,8 +455,8 @@ where
 
         match not_after.duration_since(SystemTime::now()) {
             Ok(left) => {
-                self.gauge("http.ssl.days_left", to_days(left) as f64);
-                self.gauge("http.ssl.seconds_left", left.as_secs() as f64);
+                self.gauge("http.ssl.days_left", to_days(left) as f64).await;
+                self.gauge("http.ssl.seconds_left", left.as_secs() as f64).await;
                 if left < critical {
                     self.ssl_service_check(
                         service_check::Status::Critical,
@@ -470,8 +481,8 @@ where
                 }
             }
             Err(_) => {
-                self.gauge("http.ssl.days_left", 0.);
-                self.gauge("http.ssl.seconds_left", 0.);
+                self.gauge("http.ssl.days_left", 0.).await;
+                self.gauge("http.ssl.seconds_left", 0.).await;
                 self.ssl_service_check(
                     service_check::Status::Critical,
                     "This cert is expired".to_string(),
@@ -529,7 +540,7 @@ where
                 pattern,
                 response.status().as_str()
             ));
-            self.sink.log(log::Level::Info, get_message(&message));
+            self.sink.log(log::Level::Info, get_message(&message)).await;
             self.add_service_check(
                 SvcCheckEvent::Status,
                 service_check::Status::Critical,
@@ -555,25 +566,25 @@ where
                             "Content \"{}\" found in response with the reverse_content_match",
                             needle
                         )),
-                    )
+                    ).await
                 } else {
-                    self.send_status_up(format!("{} is found in return content ", needle))
+                    self.send_status_up(format!("{} is found in return content ", needle)).await
                 }
             } else {
                 if reverse {
                     self.send_status_up(format!(
                         "{} is not found in return content with the reverse_content_match option",
                         needle
-                    ))
+                    )).await
                 } else {
                     self.send_status_down(
                         format!("{} is not found in return content", needle),
                         maybe_content(format!("Content \"{}\" not found in response.", needle)),
-                    )
+                    ).await
                 }
             }
         } else {
-            self.send_status_up(format!("{} is UP", self.instance_config.url)) // FIXME addr
+            self.send_status_up(format!("{} is UP", self.instance_config.url)).await // FIXME addr
         }
 
         Ok(())
@@ -601,21 +612,22 @@ where
         )
     }
 
-    fn gauge(&self, name: &str, value: f64) {
-        self.sink.submit_metric(
-            metric::Metric {
-                metric_type: metric::Type::Gauge,
-                name: name.to_string(),
-                value: value,
-                tags: self.tags.clone(),
-                hostname: String::new(),
-            },
-            false,
-        )
+    async fn gauge(&self, name: &str, value: f64) {
+        self.sink
+            .submit_metric(
+                metric::Metric {
+                    metric_type: metric::Type::Gauge,
+                    name: name.to_string(),
+                    value: value,
+                    tags: self.tags.clone(),
+                },
+                false,
+            )
+            .await
     }
 
-    fn send_status_up(&mut self, message: String) {
-        self.sink.log(log::Level::Debug, message);
+    async fn send_status_up(&mut self, message: String) {
+        self.sink.log(log::Level::Debug, message).await;
         self.add_service_check(
             SvcCheckEvent::Status,
             service_check::Status::Ok,
@@ -623,8 +635,8 @@ where
         )
     }
 
-    fn send_status_down(&mut self, log_msg: String, down_msg: SvcCheckMessage) {
-        self.sink.log(log::Level::Info, log_msg);
+    async fn send_status_down(&mut self, log_msg: String, down_msg: SvcCheckMessage) {
+        self.sink.log(log::Level::Info, log_msg).await;
         self.add_service_check(
             SvcCheckEvent::Status,
             service_check::Status::Critical,
@@ -683,7 +695,6 @@ fn to_service_check(lsc: LightServiceCheck, tags: &HashMap<String, String>) -> S
         name: event.to_string(),
         status: lsc.status,
         tags: tags.clone(),
-        hostname: String::new(),
         message: message,
     }
 }

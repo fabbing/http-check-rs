@@ -11,7 +11,7 @@ instances:
     content_match: toto
     reverse_content_match: true
 
-    http_response_status_code: 200
+    http_response_status_code: "200"
 
     include_content: true
     collect_response_time: true
