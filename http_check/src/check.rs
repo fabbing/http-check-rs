@@ -4,6 +4,8 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
+use tokio::sync::Mutex;
+
 use anyhow::Context;
 use bytes::Bytes;
 use http::uri::Scheme;
@@ -74,6 +76,11 @@ struct LightServiceCheck {
     message: SvcCheckMessage,
 }
 
+struct State {
+    service_checks: Vec<LightServiceCheck>,
+    tags: HashMap<String, String>,
+}
+
 pub struct HttpCheck<S>
 where
     S: Sink + Send + Sync,
@@ -81,8 +88,7 @@ where
     sink: S,
     instance_config: config::Instance,
     init_config: config::Init,
-    service_checks: Vec<LightServiceCheck>,
-    tags: HashMap<String, String>,
+    state: Mutex<State>,
 }
 
 #[async_trait]
@@ -92,18 +98,19 @@ where
 {
     type Snk = S;
 
-    fn build(sink: S, init_config: Mapping, instance_config: Mapping) -> Self
+    fn build(sink: S, init_config: Mapping, instance_config: Mapping) -> Result<Self>
     where
         S: Sink + Send + Sync,
     {
         let init_config: Init = serde_yaml::from_value(serde_yaml::Value::Mapping(init_config))
-            .expect("Failed to parse init_config");
-        let instance_config: Instance = serde_yaml::from_value(serde_yaml::Value::Mapping(instance_config))
-            .expect("Failed to parse instance_config");
-        HttpCheck::<S>::new(sink, init_config, instance_config)
+            .context("Failed to parse init_config")?;
+        let instance_config: Instance =
+            serde_yaml::from_value(serde_yaml::Value::Mapping(instance_config))
+                .context("Failed to parse instance_config")?;
+        Ok(HttpCheck::<S>::new(sink, init_config, instance_config))
     }
 
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&self) -> Result<()> {
         self.check().await
     }
 }
@@ -114,23 +121,26 @@ where
 {
     // FIXME name
     pub fn new(sink: S, init_config: config::Init, instance_config: config::Instance) -> Self {
+        let state = State {
+            service_checks: vec![],
+            tags: HashMap::<String, String>::new(),
+        };
         Self {
             sink,
             instance_config,
             init_config,
-            service_checks: vec![],
-            tags: HashMap::<String, String>::new(),
+            state: Mutex::new(state),
         }
     }
 
-    pub async fn check(&mut self) -> Result<()> {
+    pub async fn check(&self) -> Result<()> {
         if let Err(err) = self.check_impl().await {
             self.sink.log(log::Level::Error, err.to_string()).await
         }
         Ok(())
     }
 
-    async fn check_impl(&mut self) -> Result<()> {
+    async fn check_impl(&self) -> Result<()> {
         let url = self.instance_config.url.clone();
         let valid_url = url
             .scheme_str()
@@ -142,17 +152,23 @@ where
 
         let mut service_tags = HashMap::<String, String>::new();
         if let Some(tags) = &self.instance_config.tags {
-            self.tags = tags.clone();
+            self.state.lock().await.tags = tags.clone();
             service_tags = tags.clone();
         }
 
         let normalized_name = normalize_tag(&self.instance_config.name);
-        self.tags
+        self.state
+            .lock()
+            .await
+            .tags
             .insert("instance".to_string(), normalized_name.clone());
         service_tags.insert("instance".to_string(), normalized_name);
 
-        if !self.tags.contains_key("url") {
-            self.tags
+        if !self.state.lock().await.tags.contains_key("url") {
+            self.state
+                .lock()
+                .await
+                .tags
                 .insert("url".to_string(), self.instance_config.url.to_string());
         }
         if !service_tags.contains_key("url") {
@@ -178,7 +194,8 @@ where
         let request = self.make_request()?;
 
         self.sink
-            .log(log::Level::Debug, format!("Connecting to {url}")).await;
+            .log(log::Level::Debug, format!("Connecting to {url}"))
+            .await;
 
         let start_time = Instant::now();
         let elapsed = || Instant::now().duration_since(start_time);
@@ -186,15 +203,17 @@ where
         let maybe_response = self.http(tls, request).await;
         if let Err(err) = maybe_response.as_ref() {
             let elapsed = elapsed().as_millis();
-            self.sink.log(
-                log::Level::Info,
-                format!(
-                    "{} is DOWN, error: {}. Connection failed after {} ms",
-                    self.instance_config.url.to_string(),
-                    err.to_string(),
-                    elapsed
-                ),
-            ).await;
+            self.sink
+                .log(
+                    log::Level::Info,
+                    format!(
+                        "{} is DOWN, error: {}. Connection failed after {} ms",
+                        self.instance_config.url.to_string(),
+                        err.to_string(),
+                        elapsed
+                    ),
+                )
+                .await;
             self.add_service_check(
                 SvcCheckEvent::Status,
                 service_check::Status::Critical,
@@ -203,7 +222,8 @@ where
                     err.to_string(),
                     elapsed
                 )), // TODO capitalize first later
-            );
+            )
+            .await;
         }
 
         if let Ok((mut response, maybe_certificate)) = maybe_response {
@@ -234,7 +254,8 @@ where
                     .await
             }
 
-            let success = self.service_checks[0].status == service_check::Status::Ok;
+            let success =
+                self.state.lock().await.service_checks[0].status == service_check::Status::Ok;
             let can_status = if success { 1. } else { 0. };
             let cant_status = if success { 0. } else { 1. };
             self.gauge("network.http.can_connect", can_status).await;
@@ -249,7 +270,7 @@ where
             }
         }
 
-        let svc = std::mem::replace(&mut self.service_checks, vec![]);
+        let svc = std::mem::replace(&mut self.state.lock().await.service_checks, vec![]);
         for lsc in svc {
             let sc = to_service_check(lsc, &service_tags);
             self.sink.submit_service_check(sc).await;
@@ -259,7 +280,7 @@ where
     }
 
     async fn http(
-        &mut self,
+        &self,
         tls: tokio_native_tls::TlsConnector,
         request: Request<Full<Bytes>>,
     ) -> std::result::Result<(Response<body::Incoming>, Option<native_tls::Certificate>), IOErr>
@@ -393,14 +414,15 @@ where
         Ok(request.body(body)?)
     }
 
-    async fn check_certificate(&mut self, maybe_certificate: Option<native_tls::Certificate>) {
+    async fn check_certificate(&self, maybe_certificate: Option<native_tls::Certificate>) {
         let certificate = match maybe_certificate {
             Some(cert) => cert,
             None => {
                 self.ssl_service_check(
                     service_check::Status::Unknown,
                     "Empty or no certificate found.".to_string(),
-                );
+                )
+                .await;
                 return;
             }
         };
@@ -419,7 +441,8 @@ where
                         "Unable to parse the certificate to get expiration: {}",
                         err.to_string()
                     ),
-                );
+                )
+                .await;
                 return;
             }
         };
@@ -456,7 +479,8 @@ where
         match not_after.duration_since(SystemTime::now()) {
             Ok(left) => {
                 self.gauge("http.ssl.days_left", to_days(left) as f64).await;
-                self.gauge("http.ssl.seconds_left", left.as_secs() as f64).await;
+                self.gauge("http.ssl.seconds_left", left.as_secs() as f64)
+                    .await;
                 if left < critical {
                     self.ssl_service_check(
                         service_check::Status::Critical,
@@ -465,6 +489,7 @@ where
                             to_days(left)
                         ),
                     )
+                    .await
                 } else if left < warning {
                     self.ssl_service_check(
                         service_check::Status::Critical,
@@ -473,11 +498,13 @@ where
                             to_days(left)
                         ),
                     )
+                    .await
                 } else {
                     self.ssl_service_check(
                         service_check::Status::Ok,
                         format!("Days left: {}", to_days(left)),
                     )
+                    .await
                 }
             }
             Err(_) => {
@@ -487,11 +514,12 @@ where
                     service_check::Status::Critical,
                     "This cert is expired".to_string(),
                 )
+                .await
             }
         }
     }
 
-    async fn handle_response(&mut self, response: &mut Response<Incoming>) -> Result<()> {
+    async fn handle_response(&self, response: &mut Response<Incoming>) -> Result<()> {
         let mut body = Vec::<u8>::with_capacity(MAX_CONTENT_LEN);
         while let Some(frame) = response.body_mut().frame().await {
             let frame = frame?;
@@ -545,7 +573,8 @@ where
                 SvcCheckEvent::Status,
                 service_check::Status::Critical,
                 message,
-            );
+            )
+            .await;
             return Ok(());
         }
 
@@ -566,32 +595,37 @@ where
                             "Content \"{}\" found in response with the reverse_content_match",
                             needle
                         )),
-                    ).await
+                    )
+                    .await
                 } else {
-                    self.send_status_up(format!("{} is found in return content ", needle)).await
+                    self.send_status_up(format!("{} is found in return content ", needle))
+                        .await
                 }
             } else {
                 if reverse {
                     self.send_status_up(format!(
                         "{} is not found in return content with the reverse_content_match option",
                         needle
-                    )).await
+                    ))
+                    .await
                 } else {
                     self.send_status_down(
                         format!("{} is not found in return content", needle),
                         maybe_content(format!("Content \"{}\" not found in response.", needle)),
-                    ).await
+                    )
+                    .await
                 }
             }
         } else {
-            self.send_status_up(format!("{} is UP", self.instance_config.url)).await // FIXME addr
+            self.send_status_up(format!("{} is UP", self.instance_config.url))
+                .await // FIXME addr
         }
 
         Ok(())
     }
 
-    fn add_service_check(
-        &mut self,
+    async fn add_service_check(
+        &self,
         event: SvcCheckEvent,
         status: service_check::Status,
         message: SvcCheckMessage,
@@ -601,15 +635,16 @@ where
             status,
             message,
         };
-        self.service_checks.push(lsc)
+        self.state.lock().await.service_checks.push(lsc)
     }
 
-    fn ssl_service_check(&mut self, status: service_check::Status, message: String) {
+    async fn ssl_service_check(&self, status: service_check::Status, message: String) {
         self.add_service_check(
             SvcCheckEvent::SSLCert,
             status,
             SvcCheckMessage::WithoutContent(message),
         )
+        .await
     }
 
     async fn gauge(&self, name: &str, value: f64) {
@@ -619,29 +654,31 @@ where
                     metric_type: metric::Type::Gauge,
                     name: name.to_string(),
                     value: value,
-                    tags: self.tags.clone(),
+                    tags: self.state.lock().await.tags.clone(),
                 },
                 false,
             )
             .await
     }
 
-    async fn send_status_up(&mut self, message: String) {
+    async fn send_status_up(&self, message: String) {
         self.sink.log(log::Level::Debug, message).await;
         self.add_service_check(
             SvcCheckEvent::Status,
             service_check::Status::Ok,
             SvcCheckMessage::WithoutContent("UP".to_string()),
         )
+        .await
     }
 
-    async fn send_status_down(&mut self, log_msg: String, down_msg: SvcCheckMessage) {
+    async fn send_status_down(&self, log_msg: String, down_msg: SvcCheckMessage) {
         self.sink.log(log::Level::Info, log_msg).await;
         self.add_service_check(
             SvcCheckEvent::Status,
             service_check::Status::Critical,
             down_msg,
         )
+        .await
     }
 }
 
